@@ -231,7 +231,10 @@ def prepare_dataset(
         with open(output_file, 'r') as f:
             for line in f:
                 data = json.loads(line)
-                finished_ids.add(str(data[id_column]))
+                if id_column in data:
+                    finished_ids.add(str(data[id_column]))
+                elif {'org', 'repo', 'number'}.issubset(data):
+                    finished_ids.add(f"{data['org']}__{data['repo']}-{data['number']}")
         logger.warning(
             f'\nOutput file {output_file} already exists. Loaded {len(finished_ids)} finished instances.'
         )
@@ -269,6 +272,7 @@ def update_progress(
     result: EvalOutput,
     pbar: tqdm,
     output_fp: TextIO,
+    output_formatter: Callable[[EvalOutput], dict[str, Any] | str] | None = None,
 ):
     """Update the progress bar and write the result to the output file."""
     pbar.update(1)
@@ -277,7 +281,14 @@ def update_progress(
     logger.info(
         f'Finished evaluation for instance {result.instance_id}: {str(result.test_result)[:300]}...\n'
     )
-    output_fp.write(result.model_dump_json() + '\n')
+    if output_formatter is None:
+        output_fp.write(result.model_dump_json() + '\n')
+    else:
+        formatted_output = output_formatter(result)
+        if isinstance(formatted_output, str):
+            output_fp.write(formatted_output + '\n')
+        else:
+            output_fp.write(json.dumps(formatted_output) + '\n')
     output_fp.flush()
 
 
@@ -384,6 +395,7 @@ def run_evaluation(
     ],
     max_retries: int = 5,  # number of retries for each instance
     timeout_seconds: int | None = None,
+    output_formatter: Callable[[EvalOutput], dict[str, Any] | str] | None = None,
 ):
     use_multiprocessing = num_workers > 1
 
@@ -416,7 +428,7 @@ def run_evaluation(
                 )
                 results = pool.imap_unordered(_process_instance_wrapper_mp, args_iter)
                 for result in results:
-                    update_progress(result, pbar, output_fp)
+                    update_progress(result, pbar, output_fp, output_formatter)
         else:
             for _, instance in dataset.iterrows():
                 result = _process_instance_wrapper(
@@ -426,7 +438,7 @@ def run_evaluation(
                     use_mp=False,
                     max_retries=max_retries,
                 )
-                update_progress(result, pbar, output_fp)
+                update_progress(result, pbar, output_fp, output_formatter)
 
     except KeyboardInterrupt:
         print('\nKeyboardInterrupt received. Cleaning up...\n')

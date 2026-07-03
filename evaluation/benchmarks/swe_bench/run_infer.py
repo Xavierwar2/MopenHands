@@ -755,6 +755,28 @@ def process_instance(
     return output
 
 
+def format_multiswebench_output(result: EvalOutput) -> dict[str, object]:
+    instance = result.instance or {}
+    repo_slug = str(instance.get('repo') or '')
+    if '/' in repo_slug:
+        org, repo = repo_slug.split('/', 1)
+    else:
+        org, repo_with_number = result.instance_id.split('__', 1)
+        repo = repo_with_number.rsplit('-', 1)[0]
+
+    number = instance.get('number')
+    if number is None:
+        _, issue_number = result.instance_id.rsplit('-', 1)
+        number = int(issue_number) if issue_number.isdigit() else issue_number
+
+    return {
+        'org': org,
+        'repo': repo,
+        'number': number,
+        'fix_patch': result.test_result.get('git_patch', ''),
+    }
+
+
 def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
     file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.toml')
     if os.path.exists(file_path):
@@ -849,4 +871,5 @@ if __name__ == '__main__':
         process_instance,
         timeout_seconds=120 * 60,  # 2 hour PER instance should be more than enough
         max_retries=5,
+        output_formatter=format_multiswebench_output,
     )
