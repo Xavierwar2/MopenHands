@@ -220,6 +220,7 @@ def prepare_dataset(
     eval_n_limit: int,
     eval_ids: list[str] | None = None,
     skip_num: int | None = None,
+    skip_finished: bool = True,
 ):
     assert (
         'instance_id' in dataset.columns
@@ -227,7 +228,7 @@ def prepare_dataset(
     id_column = 'instance_id'
     logger.info(f'Writing evaluation output to {output_file}')
     finished_ids: set[str] = set()
-    if os.path.exists(output_file):
+    if skip_finished and os.path.exists(output_file):
         with open(output_file, 'r') as f:
             for line in f:
                 data = json.loads(line)
@@ -238,6 +239,8 @@ def prepare_dataset(
         logger.warning(
             f'\nOutput file {output_file} already exists. Loaded {len(finished_ids)} finished instances.'
         )
+    elif not skip_finished:
+        logger.info('Skipping finished instances is disabled.')
 
     if eval_ids:
         eval_ids_converted = [dataset[id_column].dtype.type(id) for id in eval_ids]

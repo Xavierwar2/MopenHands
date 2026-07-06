@@ -303,12 +303,15 @@ def get_instance_docker_image(instance: pd.Series):
         )  # to comply with docker image naming convention
         return (DOCKER_IMAGE_PREFIX.rstrip('/') + '/' + image_name).lower()
     else:
-        container_name = instance.get('repo', '').lower()
+        container_name = instance.get('repo', '').lower().replace('/', '_m_')
         instance_id = instance.get('instance_id', '')
         tag_suffix = instance_id.split('-')[-1] if instance_id else ''
         container_tag = f"pr-{tag_suffix}"
         # pdb.set_trace()
-        return f"{container_name}:{container_tag}"
+        image_name = f"{container_name}:{container_tag}"
+        if DOCKER_IMAGE_PREFIX:
+            image_name = DOCKER_IMAGE_PREFIX.rstrip('/') + '/' + image_name
+        return image_name.lower()
         # return "kong/insomnia:pr-8284"
         # return "'sweb.eval.x86_64.local_insomnia"
         # return "local_insomnia_why"
@@ -812,6 +815,19 @@ if __name__ == '__main__':
         default='test',
         help='split to evaluate on',
     )
+    parser.add_argument(
+        '--skip-existing-output',
+        default=True,
+        dest='skip_existing_output',
+        action='store_true',
+        help='skip instances already present in output.jsonl under the evaluation output directory',
+    )
+    parser.add_argument(
+        '--no-skip-existing-output',
+        dest='skip_existing_output',
+        action='store_false',
+        help='rerun instances even if they are already present in output.jsonl',
+    )
     args, _ = parser.parse_known_args()
 
     # NOTE: It is preferable to load datasets from huggingface datasets and perform post-processing
@@ -827,13 +843,21 @@ if __name__ == '__main__':
 
     llm_config = None
     if args.llm_config:
-        llm_config = get_llm_config_arg(args.llm_config)
+        llm_config = get_llm_config_arg(args.llm_config, args.config_file)
+        if llm_config is None:
+            raise ValueError(
+                f'Could not find LLM config: --llm-config {args.llm_config} '
+                f'in {args.config_file}'
+            )
         llm_config.log_completions = True
         # modify_params must be False for evaluation purpose, for reproducibility and accurancy of results
         llm_config.modify_params = False
 
     if llm_config is None:
-        raise ValueError(f'Could not find LLM config: --llm_config {args.llm_config}')
+        raise ValueError(
+            f'Could not find LLM config: --llm-config {args.llm_config} '
+            f'in {args.config_file}'
+        )
 
     details = {}
     _agent_cls = openhands.agenthub.Agent.get_cls(args.agent_cls)
@@ -853,7 +877,12 @@ if __name__ == '__main__':
 
     output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
     print(f'### OUTPUT FILE: {output_file} ###')
-    instances = prepare_dataset(swe_bench_tests, output_file, args.eval_n_limit)
+    instances = prepare_dataset(
+        swe_bench_tests,
+        output_file,
+        args.eval_n_limit,
+        skip_finished=args.skip_existing_output,
+    )
 
     if len(instances) > 0 and not isinstance(
         instances['FAIL_TO_PASS'][instances['FAIL_TO_PASS'].index[0]], str

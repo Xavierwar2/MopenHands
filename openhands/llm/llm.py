@@ -1,4 +1,5 @@
 import copy
+import json as jsonlib
 import os
 import time
 import warnings
@@ -233,7 +234,16 @@ class LLM(RetryMixin, DebugMixin):
             start_time = time.time()
 
             # we don't support streaming here, thus we get a ModelResponse
-            resp: ModelResponse = self._completion_unwrapped(*args, **kwargs)
+            try:
+                resp: ModelResponse = self._completion_unwrapped(*args, **kwargs)
+            except Exception as e:
+                if not self._should_use_openai_compatible_http_fallback(e):
+                    raise
+                logger.warning(
+                    'LiteLLM OpenAI-compatible response parsing failed; '
+                    'retrying completion via direct HTTP fallback.'
+                )
+                resp = self._completion_via_openai_compatible_http(kwargs)
 
             # Calculate and record latency
             latency = time.time() - start_time
@@ -307,6 +317,184 @@ class LLM(RetryMixin, DebugMixin):
             return resp
 
         self._completion = wrapper
+
+    def _should_use_openai_compatible_http_fallback(self, error: Exception) -> bool:
+        return (
+            self.config.base_url is not None
+            and 'openai' in (self.config.custom_llm_provider or self.config.model).lower()
+            and "'str' object has no attribute 'model_dump'" in str(error)
+        )
+
+    def _make_json_serializable(self, value):
+        if hasattr(value, 'model_dump'):
+            return self._make_json_serializable(value.model_dump())
+        if isinstance(value, dict):
+            return {k: self._make_json_serializable(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._make_json_serializable(v) for v in value]
+        return value
+
+    def _completion_via_openai_compatible_http(
+        self, kwargs: dict[str, Any]
+    ) -> ModelResponse:
+        if self.config.base_url is None:
+            raise RuntimeError('base_url is required for OpenAI-compatible HTTP fallback')
+
+        payload_keys = {
+            'messages',
+            'tools',
+            'tool_choice',
+            'response_format',
+            'stop',
+        }
+        payload = {
+            key: self._make_json_serializable(value)
+            for key, value in kwargs.items()
+            if key in payload_keys and value is not None
+        }
+        payload['model'] = self.config.model.split('/')[-1]
+        if self.config.temperature is not None:
+            payload['temperature'] = self.config.temperature
+        if self.config.top_p is not None:
+            payload['top_p'] = self.config.top_p
+        payload['stream'] = True
+
+        headers = {'Content-Type': 'application/json', 'Accept': 'text/event-stream'}
+        if self.config.api_key:
+            headers['Authorization'] = (
+                f'Bearer {self.config.api_key.get_secret_value()}'
+            )
+
+        url = f'{self.config.base_url.rstrip("/")}/chat/completions'
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=self.config.timeout,
+            stream=True,
+        )
+        response.raise_for_status()
+
+        if response.headers.get('content-type', '').startswith('text/event-stream'):
+            data = self._parse_openai_compatible_sse_lines(response.iter_lines())
+            if data is None:
+                raise RuntimeError(
+                    'OpenAI-compatible HTTP fallback returned an empty SSE response'
+                )
+            return ModelResponse(**data)
+
+        response_text = response.text
+        try:
+            data = jsonlib.loads(response_text)
+        except ValueError as e:
+            data = self._parse_openai_compatible_sse_response(response_text)
+            if data is None:
+                raise RuntimeError(
+                    f'OpenAI-compatible HTTP fallback returned non-JSON response: {response_text[:500]}'
+                ) from e
+
+        if isinstance(data, str):
+            try:
+                data = jsonlib.loads(data)
+            except ValueError:
+                data = {
+                    'id': 'openhands-http-fallback',
+                    'object': 'chat.completion',
+                    'created': int(time.time()),
+                    'model': payload['model'],
+                    'choices': [
+                        {
+                            'index': 0,
+                            'message': {'role': 'assistant', 'content': data},
+                            'finish_reason': 'stop',
+                        }
+                    ],
+                }
+
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f'OpenAI-compatible HTTP fallback returned unsupported JSON type: {type(data).__name__}'
+            )
+
+        return ModelResponse(**data)
+
+    def _parse_openai_compatible_sse_response(
+        self, response_text: str
+    ) -> dict[str, Any] | None:
+        if not response_text.lstrip().startswith('data:'):
+            return None
+
+        return self._parse_openai_compatible_sse_lines(response_text.splitlines())
+
+    def _parse_openai_compatible_sse_lines(
+        self, lines
+    ) -> dict[str, Any] | None:
+        saw_sse_payload = False
+
+        response_id = 'openhands-http-fallback'
+        model = self.config.model.split('/')[-1]
+        created = int(time.time())
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        finish_reason = 'stop'
+        usage = None
+
+        for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode('utf-8', errors='replace')
+            line = str(line).strip()
+            if not line.startswith('data:'):
+                continue
+
+            payload = line[len('data:') :].strip()
+            if not payload or payload == '[DONE]':
+                continue
+            saw_sse_payload = True
+
+            try:
+                chunk = jsonlib.loads(payload)
+            except ValueError:
+                continue
+
+            response_id = chunk.get('id') or response_id
+            model = chunk.get('model') or model
+            created = chunk.get('created') or created
+            usage = chunk.get('usage') or usage
+
+            for choice in chunk.get('choices') or []:
+                finish_reason = choice.get('finish_reason') or finish_reason
+                delta = choice.get('delta') or choice.get('message') or {}
+                if delta.get('content'):
+                    content_parts.append(delta['content'])
+                if delta.get('tool_calls'):
+                    tool_calls.extend(delta['tool_calls'])
+
+        if not saw_sse_payload:
+            return None
+
+        message: dict[str, Any] = {
+            'role': 'assistant',
+            'content': ''.join(content_parts),
+        }
+        if tool_calls:
+            message['tool_calls'] = tool_calls
+
+        data: dict[str, Any] = {
+            'id': response_id,
+            'object': 'chat.completion',
+            'created': created,
+            'model': model,
+            'choices': [
+                {
+                    'index': 0,
+                    'message': message,
+                    'finish_reason': finish_reason,
+                }
+            ],
+        }
+        if usage:
+            data['usage'] = usage
+        return data
 
     @property
     def completion(self):

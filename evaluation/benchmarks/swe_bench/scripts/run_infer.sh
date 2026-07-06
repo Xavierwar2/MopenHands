@@ -12,7 +12,10 @@ NUM_WORKERS=$6
 DATASET=$7
 # SPLIT=$8
 LANGUAGE=$8
-# N_RUNS=$10
+OUTPUT_DIR=$9
+SKIP_EXISTING_OUTPUT=${10}
+CONFIG_FILE=${11:-config.toml}
+# N_RUNS is read from the environment below.
 
 if [ -z "$NUM_WORKERS" ]; then
   NUM_WORKERS=1
@@ -74,6 +77,9 @@ if [ -z "$EVAL_DOCKER_IMAGE_PREFIX" ]; then
   elif [ "$LANGUAGE" = "java" ]; then
   echo "EVAL_DOCKER_IMAGE_PREFIX is java_verified as LANUGUAGE is java"
     EVAL_DOCKER_IMAGE_PREFIX=""
+  else
+  echo "EVAL_DOCKER_IMAGE_PREFIX is mswebench/ as default as LANUGUAGE is $LANGUAGE"
+    EVAL_DOCKER_IMAGE_PREFIX="mswebench/"
   fi
 fi
 
@@ -121,12 +127,26 @@ function run_eval() {
     --max-iterations $MAX_ITER \
     --eval-num-workers $NUM_WORKERS \
     --eval-note $eval_note \
+    --config-file \"$CONFIG_FILE\" \
     --dataset $DATASET \
     --split $SPLIT"
 
   if [ -n "$EVAL_LIMIT" ]; then
     echo "EVAL_LIMIT: $EVAL_LIMIT"
     COMMAND="$COMMAND --eval-n-limit $EVAL_LIMIT"
+  fi
+
+  if [ -n "$OUTPUT_DIR" ]; then
+    echo "OUTPUT_DIR: $OUTPUT_DIR"
+    COMMAND="$COMMAND --eval-output-dir \"$OUTPUT_DIR\""
+  fi
+
+  if [ "$SKIP_EXISTING_OUTPUT" = true ]; then
+    echo "SKIP_EXISTING_OUTPUT: $SKIP_EXISTING_OUTPUT"
+    COMMAND="$COMMAND --skip-existing-output"
+  elif [ "$SKIP_EXISTING_OUTPUT" = false ]; then
+    echo "SKIP_EXISTING_OUTPUT: $SKIP_EXISTING_OUTPUT"
+    COMMAND="$COMMAND --no-skip-existing-output"
   fi
 
   # Run the command

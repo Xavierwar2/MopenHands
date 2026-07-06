@@ -187,10 +187,20 @@ def build_runtime_image_in_folder(
     runtime_image_repo = base_image + "_runtime"
     # repo, tag = base_image.split(":")
     # runtime_image_repo = f"{repo}_runtime:{tag}"
-    logger.info(f'Building image: {runtime_image_repo}')
+    logger.info(f'Runtime base image: [{base_image}]')
+    logger.info(f'Runtime image candidate: [{runtime_image_repo}]')
+
+    base_image_exists = runtime_builder.image_exists(base_image, False)
+    logger.info(
+        f'Runtime base image exists locally: [{base_image}] -> {base_image_exists}'
+    )
+
     if force_rebuild:
         logger.debug(
             f'Force rebuild: [{runtime_image_repo}] from scratch.'
+        )
+        logger.info(
+            f'Runtime image force rebuild enabled; skipping reuse check for [{runtime_image_repo}]'
         )
         prep_build_folder(
             build_folder,
@@ -212,9 +222,15 @@ def build_runtime_image_in_folder(
     build_from = BuildFromImageType.SCRATCH
 
     # If the exact image already exists, we do not need to build it
-    if runtime_builder.image_exists(runtime_image_repo, False):
+    runtime_image_exists = runtime_builder.image_exists(runtime_image_repo, False)
+    logger.info(
+        f'Runtime image exists locally: [{runtime_image_repo}] -> {runtime_image_exists}'
+    )
+    if runtime_image_exists:
         logger.info(f'Reusing Image [{runtime_image_repo}]')
         return runtime_image_repo
+
+    logger.info(f'Runtime image not found locally; building [{runtime_image_repo}]')
 
     # We look for an existing image that shares the same lock_tag. If such an image exists, we
     # can use it as the base image for the build and just copy source files. This makes the build
