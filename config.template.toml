@@ -197,6 +197,10 @@ model = "gpt-4o"
 [llm.gpt4o-mini]
 api_key = ""
 model = "gpt-4o"
+[llm.gpt54]
+api_key = ""
+model = "openai/gpt-5.4"
+base_url = ""
 
 
 #################################### Agent ###################################
