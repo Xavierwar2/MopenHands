@@ -5,8 +5,10 @@ This runtime runs the action_execution_server directly on the local machine with
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
+from collections import deque
 from typing import Callable, Optional
 
 import requests
@@ -40,7 +42,9 @@ from openhands.utils.async_utils import call_sync_from_async
 from openhands.utils.tenacity_stop import stop_if_should_exit
 
 
-def check_dependencies(code_repo_path: str, poetry_venvs_path: str):
+def check_dependencies(
+    code_repo_path: str, poetry_venvs_path: str, check_browser: bool = True
+):
     ERROR_MESSAGE = 'Please follow the instructions in https://github.com/All-Hands-AI/OpenHands/blob/main/Development.md to install OpenHands.'
     if not os.path.exists(code_repo_path):
         raise ValueError(
@@ -75,12 +79,105 @@ def check_dependencies(code_repo_path: str, poetry_venvs_path: str):
     if 'test' not in pane_output:
         raise ValueError('libtmux is not properly installed. ' + ERROR_MESSAGE)
 
-    # Check browser works
-    logger.debug('Checking dependencies: browser')
-    from openhands.runtime.browser.browser_env import BrowserEnv
+    if check_browser:
+        # Check browser works
+        logger.debug('Checking dependencies: browser')
+        from openhands.runtime.browser.browser_env import BrowserEnv
 
-    browser = BrowserEnv()
-    browser.close()
+        browser = BrowserEnv()
+        browser.close()
+
+
+def should_check_browser_dependency(config: AppConfig) -> bool:
+    if os.environ.get('SKIP_LOCAL_RUNTIME_BROWSER_CHECK', 'false').lower() == 'true':
+        return False
+    return config.get_agent_config().codeact_enable_browsing
+
+
+def filter_local_runtime_plugins(
+    config: AppConfig, plugins: list[PluginRequirement] | None
+) -> list[PluginRequirement] | None:
+    if not plugins:
+        return plugins
+
+    disabled_plugins: set[str] = set()
+    if not config.get_agent_config().codeact_enable_jupyter:
+        disabled_plugins.update({'jupyter', 'agent_skills'})
+
+    extra_disabled = os.environ.get('LOCAL_RUNTIME_DISABLED_PLUGINS', '')
+    disabled_plugins.update(
+        plugin.strip() for plugin in extra_disabled.split(',') if plugin.strip()
+    )
+
+    if not disabled_plugins:
+        return plugins
+
+    filtered_plugins = [
+        plugin for plugin in plugins if plugin.name not in disabled_plugins
+    ]
+    skipped_plugins = [
+        plugin.name for plugin in plugins if plugin.name in disabled_plugins
+    ]
+    if skipped_plugins:
+        logger.info(
+            f'Skipping LocalRuntime plugins: {", ".join(skipped_plugins)}'
+        )
+    return filtered_plugins
+
+
+def get_poetry_virtualenv_path(code_repo_path: str, env: dict[str, str]) -> str:
+    candidates: list[str] = []
+
+    try:
+        output = subprocess.check_output(
+            ['poetry', 'env', 'info', '--path'],
+            env=env,
+            cwd=code_repo_path,
+            text=True,
+            shell=False,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if output:
+            candidates.append(output)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    try:
+        output = subprocess.check_output(
+            ['poetry', 'show', '-v'],
+            env=env,
+            cwd=code_repo_path,
+            text=True,
+            shell=False,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in output.splitlines():
+            if ':' in line:
+                value = line.split(':', 1)[1].strip()
+                if value:
+                    candidates.append(value)
+                    break
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    candidates.extend(
+        value
+        for value in [
+            env.get('POETRY_VIRTUALENVS_PATH'),
+            env.get('VIRTUAL_ENV'),
+            sys.prefix,
+        ]
+        if value
+    )
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise ValueError(
+        'Could not determine Poetry virtual environment path. '
+        f'Tried: {", ".join(candidates) if candidates else "(none)"}'
+    )
 
 
 class LocalRuntime(ActionExecutionClient):
@@ -107,6 +204,7 @@ class LocalRuntime(ActionExecutionClient):
         headless_mode: bool = True,
     ):
         self.config = config
+        plugins = filter_local_runtime_plugins(config, plugins)
         self._user_id = os.getuid()
         self._username = os.getenv('USER')
 
@@ -156,6 +254,7 @@ class LocalRuntime(ActionExecutionClient):
         self.api_url = f'{self.config.sandbox.local_runtime_url}:{self._host_port}'
         self.status_callback = status_callback
         self.server_process: Optional[subprocess.Popen[str]] = None
+        self._server_logs: deque[str] = deque(maxlen=200)
         self.action_semaphore = threading.Semaphore(1)  # Ensure one action at a time
 
         # Update env vars
@@ -203,26 +302,18 @@ class LocalRuntime(ActionExecutionClient):
         env = os.environ.copy()
         # Get the code repo path
         code_repo_path = os.path.dirname(os.path.dirname(openhands.__file__))
-        env['PYTHONPATH'] = f'{code_repo_path}:$PYTHONPATH'
+        env['PYTHONPATH'] = f"{code_repo_path}:{env.get('PYTHONPATH', '')}"
         env['OPENHANDS_REPO_PATH'] = code_repo_path
         env['LOCAL_RUNTIME_MODE'] = '1'
-        # run poetry show -v | head -n 1 | awk '{print $2}'
-        poetry_venvs_path = (
-            subprocess.check_output(
-                ['poetry', 'show', '-v'],
-                env=env,
-                cwd=code_repo_path,
-                text=True,
-                shell=False,
-            )
-            .splitlines()[0]
-            .split(':')[1]
-            .strip()
-        )
+        poetry_venvs_path = get_poetry_virtualenv_path(code_repo_path, env)
         env['POETRY_VIRTUALENVS_PATH'] = poetry_venvs_path
         logger.debug(f'POETRY_VIRTUALENVS_PATH: {poetry_venvs_path}')
 
-        check_dependencies(code_repo_path, poetry_venvs_path)
+        check_dependencies(
+            code_repo_path,
+            poetry_venvs_path,
+            check_browser=should_check_browser_dependency(self.config),
+        )
         self.server_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -230,19 +321,22 @@ class LocalRuntime(ActionExecutionClient):
             universal_newlines=True,
             bufsize=1,
             env=env,
+            cwd=code_repo_path,
         )
 
         # Start a thread to read and log server output
         def log_output():
             while (
                 self.server_process
-                and self.server_process.poll()
+                and self.server_process.poll() is None
                 and self.server_process.stdout
             ):
                 line = self.server_process.stdout.readline()
                 if not line:
                     break
-                self.log('debug', f'Server: {line.strip()}')
+                line = line.rstrip()
+                self._server_logs.append(line)
+                self.log('debug', f'Server: {line}')
 
         self._log_thread = threading.Thread(target=log_output, daemon=True)
         self._log_thread.start()
@@ -250,7 +344,14 @@ class LocalRuntime(ActionExecutionClient):
         self.log('info', f'Waiting for server to become ready at {self.api_url}...')
         self.send_status_message('STATUS$WAITING_FOR_CLIENT')
 
-        await call_sync_from_async(self._wait_until_alive)
+        try:
+            await call_sync_from_async(self._wait_until_alive)
+        except Exception as exc:
+            recent_logs = '\n'.join(self._server_logs)
+            raise RuntimeError(
+                f'Local runtime server did not become ready at {self.api_url}: {exc}\n'
+                f'Recent server logs:\n{recent_logs or "(no server output captured)"}'
+            ) from exc
 
         if not self.attach_to_existing:
             await call_sync_from_async(self.setup_initial_env)
@@ -280,7 +381,11 @@ class LocalRuntime(ActionExecutionClient):
     def _wait_until_alive(self):
         """Wait until the server is ready to accept requests."""
         if self.server_process and self.server_process.poll() is not None:
-            raise RuntimeError('Server process died')
+            recent_logs = '\n'.join(self._server_logs)
+            raise RuntimeError(
+                'Server process died.\n'
+                f'Recent server logs:\n{recent_logs or "(no server output captured)"}'
+            )
 
         try:
             response = self.session.get(f'{self.api_url}/alive')

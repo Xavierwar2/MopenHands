@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import tempfile
 from typing import Any
 
@@ -47,6 +48,7 @@ import pdb
 USE_HINT_TEXT = os.environ.get('USE_HINT_TEXT', 'false').lower() == 'true'
 USE_INSTANCE_IMAGE = os.environ.get('USE_INSTANCE_IMAGE', 'true').lower() == 'true'
 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
+RUNTIME = os.environ.get('RUNTIME', 'docker')
 
 # TODO: migrate all swe-bench docker to ghcr.io/openhands
 # TODO: 适应所有的语言
@@ -60,12 +62,145 @@ AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
 }
 
 
+def _cleanup_runtime_image(runtime: Runtime) -> None:
+    runtime_image = getattr(runtime, 'runtime_container_image', None)
+    container_name = getattr(runtime, 'container_name', None)
+    if not runtime_image:
+        logger.info('Runtime image cleanup skipped: no runtime image was recorded.')
+        return
+
+    import docker
+
+    docker_client = docker.from_env()
+    try:
+        if container_name:
+            try:
+                container = docker_client.containers.get(container_name)
+                container.remove(force=True)
+                logger.info(f'Removed runtime container: {container_name}')
+            except docker.errors.NotFound:
+                logger.info(f'Runtime container already removed: {container_name}')
+            except docker.errors.APIError as exc:
+                logger.warning(
+                    f'Failed to remove runtime container {container_name}: {exc}'
+                )
+
+        try:
+            docker_client.images.remove(runtime_image, force=True)
+            logger.info(f'Removed runtime image: {runtime_image}')
+        except docker.errors.ImageNotFound:
+            logger.info(f'Runtime image already removed: {runtime_image}')
+        except docker.errors.APIError as exc:
+            logger.warning(f'Failed to remove runtime image {runtime_image}: {exc}')
+    finally:
+        docker_client.close()
+
+
+def _should_cleanup_runtime_image(metadata: EvalMetadata) -> bool:
+    return bool((metadata.details or {}).get('cleanup_runtime_image', False))
+
+
 def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
     return f'{instance.repo}__{instance.version}'.replace('/', '__')
 
 
+def _get_issue_number(instance: pd.Series) -> str:
+    number = instance.get('number')
+    if number is not None:
+        return str(number)
+    instance_id = str(instance['instance_id'])
+    return instance_id.rsplit('-', 1)[-1]
+
+
+def _get_default_local_repo_base_dir(instance: pd.Series) -> str:
+    repo = str(instance['repo'])
+    return os.path.join(os.path.dirname(__file__), 'data', *repo.split('/'))
+
+
+def _get_local_repo_path(instance: pd.Series, metadata: EvalMetadata) -> str:
+    details = metadata.details or {}
+    local_repo_base_dir = (
+        details.get('local_repo_base_dir')
+        or os.environ.get('LOCAL_REPO_BASE_DIR')
+        or _get_default_local_repo_base_dir(instance)
+    )
+    candidate_names = [
+        _get_issue_number(instance),
+        str(instance['instance_id']),
+        _get_swebench_workspace_dir_name(instance),
+    ]
+    for name in candidate_names:
+        candidate = os.path.abspath(os.path.join(local_repo_base_dir, name))
+        if os.path.isdir(os.path.join(candidate, '.git')):
+            return candidate
+
+    direct_path = os.path.abspath(local_repo_base_dir)
+    if os.path.isdir(os.path.join(direct_path, '.git')):
+        return direct_path
+
+    searched = ', '.join(candidate_names + [direct_path])
+    raise FileNotFoundError(
+        f'Could not find a local git repo for {instance["instance_id"]}. '
+        f'Searched under {local_repo_base_dir}: {searched}'
+    )
+
+
+def _get_runtime_name(metadata: EvalMetadata | None = None) -> str:
+    if metadata and metadata.details and metadata.details.get('runtime'):
+        return str(metadata.details['runtime'])
+    return os.environ.get('RUNTIME', RUNTIME)
+
+
+def _is_local_runtime(metadata: EvalMetadata | None = None) -> bool:
+    return _get_runtime_name(metadata) == 'local'
+
+
+def _get_workspace_path(instance: pd.Series, metadata: EvalMetadata) -> str:
+    if _is_local_runtime(metadata):
+        return _get_local_repo_path(instance, metadata)
+    return f'/workspace/{_get_swebench_workspace_dir_name(instance)}'
+
+
+def _shell_quote_path(path: str) -> str:
+    return shlex.quote(path.replace('\\', '/'))
+
+
+def _clean_git_patch(git_patch: str) -> str:
+    cleaned = ''.join(
+        line
+        for line in git_patch.splitlines(keepends=True)
+        if line.rstrip('\r\n') != r'\ No newline at end of file'
+    )
+    if cleaned and not cleaned.endswith('\n'):
+        cleaned += '\n'
+    return cleaned
+
+
+def _git_add_command() -> str:
+    excluded_pathspecs = [
+        ':!.git_config',
+        ':!patch.diff',
+        ':(exclude,glob)repro*',
+        ':(exclude,glob)reproduce*',
+        ':(exclude,glob)*-repro*',
+        ':(exclude,glob)**/repro*',
+        ':(exclude,glob)**/reproduce*',
+        ':(exclude,glob)**/*-repro*',
+        ':(exclude,glob)tsconfig.*.json',
+        ':(exclude,glob)**/*.test.*',
+        ':(exclude,glob)**/*.spec.*',
+        ':(exclude,glob)test/**',
+        ':(exclude,glob)**/test/**',
+        ':(exclude,glob)**/tests/**',
+    ]
+    return "git add -A -- . " + ' '.join(
+        shlex.quote(pathspec) for pathspec in excluded_pathspecs
+    )
+
+
 def get_instruction(instance: pd.Series, metadata: EvalMetadata):
-    workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+    workspace_path = _get_workspace_path(instance, metadata)
+    workspace_name = os.path.basename(workspace_path.rstrip('/\\'))
     # Prepare instruction
 
     # Instruction based on Anthropic's official trajectory
@@ -73,16 +208,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
     instructions = {
         "python":(
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a python code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a python code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             'Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n'
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development Python environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            'Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n'
+            f'Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n'
             'Follow these steps to resolve the issue:\n'
             '1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n'
             '2. Create a script to reproduce the error and execute it with `python <filename.py>` using the BashTool, to confirm the error.\n'
@@ -98,16 +233,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
         ),
         "java": (
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a Java code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a Java code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             "Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n"
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development Java environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            "Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n"
+            f"Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n"
             "Follow these steps to resolve the issue:\n"
             "1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n"
             '2. Create a Java class to reproduce the error and execute it by first compiling with `javac <classname>.java` and then running with `java <classname>` using the BashTool, to confirm the error\n'
@@ -123,16 +258,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
         ),
         "go": (
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a Go code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a Go code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             'Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n'
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development Go environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            'Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n'
+            f'Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n'
             'Follow these steps to resolve the issue:\n'
             '1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n'
             '2. Create a script or a function to reproduce the error and execute it with `go run <filename.go>` using the BashTool, to confirm the error.\n'
@@ -148,16 +283,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
         ),
         "c": (
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a C code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a C code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             'Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n'
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development C environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            'Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n'
+            f'Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n'
             'Follow these steps to resolve the issue:\n'
             '1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n'
             '2. Create a script to reproduce the error by compiling your C code (for example, using `gcc <filename.c> -o <executable>`) and then running the executable using the BashTool, to confirm the error.\n'
@@ -173,16 +308,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
         ),
         "cpp": (
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a C++ code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a C++ code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             'Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n'
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development C++ environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            'Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n'
+            f'Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n'
             'Follow these steps to resolve the issue:\n'
             '1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n'
             '2. Create or adapt a small executable (e.g., a main file or a test driver) to reproduce the issue. Build and run it (for example, by using `g++ -o reproduce reproduce.cpp && ./reproduce` via the BashTool) to confirm the error.\n'
@@ -198,16 +333,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
         ),
         "javascript": (
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a Javascript code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a Javascript code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             'Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n'
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development Javascript environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            'Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n'
+            f'Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n'
             'Follow these steps to resolve the issue:\n'
             '1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n'
             '2. Create a script to reproduce the error and execute it with `node <filename.js>` using the BashTool, to confirm the error.\n'
@@ -223,16 +358,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
         ),
         "typescript":(
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a Typescript code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a Typescript code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             'Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n'
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development Typescript environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            'Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n'
+            f'Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n'
             'Follow these steps to resolve the issue:\n'
             '1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n'
             '2. Create a script to reproduce the error and execute it with `ts-node <filename.ts>` using the BashTool, to confirm the error.\n'
@@ -248,16 +383,16 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata):
         ),
         "rust":(
             '<uploaded_files>\n'
-            f'/workspace/{workspace_dir_name}\n'
+            f'{workspace_path}\n'
             '</uploaded_files>\n'
-            f"I've uploaded a Rust code repository in the directory {workspace_dir_name}. Consider the following issue description:\n\n"
+            f"I've uploaded a Rust code repository in the directory {workspace_name}. Consider the following issue description:\n\n"
             f'<issue_description>\n'
             f'{instance.problem_statement}\n'
             '</issue_description>\n\n'
             'Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?\n'
             "I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!\n"
             "Also the development Rust environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.\n"
-            'Your task is to make the minimal changes to non-test files in the /workspace directory to ensure the <issue_description> is satisfied.\n'
+            f'Your task is to make the minimal changes to non-test files in the {workspace_path} directory to ensure the <issue_description> is satisfied.\n'
             'Follow these steps to resolve the issue:\n'
             '1. As a first step, it might be a good idea to explore the repo to familiarize yourself with its structure.\n'
             '2. Create a reproduction script (or binary) that triggers the error and execute it with `cargo run --bin <filename>` using the BashTool, to confirm the error.\n'
@@ -324,7 +459,14 @@ def get_config(
     metadata: EvalMetadata,
 ) -> AppConfig:
     SWE_BENCH_CONTAINER_IMAGE = 'ghcr.io/opendevin/eval-swe-bench:full-v1.2.1'
-    if USE_INSTANCE_IMAGE:
+    runtime_name = _get_runtime_name(metadata)
+    workspace_base = None
+    workspace_mount_path = None
+    base_container_image = None
+    if runtime_name == 'local':
+        workspace_base = _get_local_repo_path(instance, metadata)
+        logger.info(f'Using local runtime repository: {workspace_base}')
+    elif USE_INSTANCE_IMAGE:
         # We use a different instance image for the each instance of swe-bench eval
         # base_container_image = get_instance_docker_image(instance['instance_id'])
         base_container_image = get_instance_docker_image(instance)
@@ -352,11 +494,10 @@ def get_config(
         default_agent=metadata.agent_class,
         run_as_openhands=False,
         max_iterations=metadata.max_iterations,
-        runtime=os.environ.get('RUNTIME', 'docker'),
+        runtime=runtime_name,
         sandbox=sandbox_config,
-        # do not mount workspace
-        workspace_base=None,
-        workspace_mount_path=None,
+        workspace_base=workspace_base,
+        workspace_mount_path=workspace_mount_path,
     )
     config.set_llm_config(
         update_llm_config_for_completions_logging(
@@ -377,6 +518,7 @@ def get_config(
 def initialize_runtime(
     runtime: Runtime,
     instance: pd.Series,  # this argument is not required
+    metadata: EvalMetadata,
 ):
     """Initialize the runtime for the agent.
 
@@ -385,7 +527,8 @@ def initialize_runtime(
     logger.info('-' * 30)
     logger.info('BEGIN Runtime Initialization Fn')
     logger.info('-' * 30)
-    workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+    workspace_path = _get_workspace_path(instance, metadata)
+    quoted_workspace_path = _shell_quote_path(workspace_path)
     obs: CmdOutputObservation
 
     REPO_NAME = instance['repo'].split('/')[-1]
@@ -408,7 +551,11 @@ def initialize_runtime(
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(obs.exit_code == 0, f'Failed to export USER: {str(obs)}')
 
-    if USE_INSTANCE_IMAGE:
+    if _is_local_runtime(metadata):
+        logger.info(
+            f'Local runtime selected; using existing local repository at {workspace_path}'
+        )
+    elif USE_INSTANCE_IMAGE:
         # inject the init script
         script_dir = os.path.dirname(__file__)
 
@@ -478,31 +625,35 @@ def initialize_runtime(
             f'Failed to source /swe_util/swe_entry.sh: {str(obs)}',
         )
 
-    action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+    action = CmdRunAction(command=f'cd {quoted_workspace_path}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(
         obs.exit_code == 0,
-        f'Failed to cd to /workspace/{workspace_dir_name}: {str(obs)}',
+        f'Failed to cd to {workspace_path}: {str(obs)}',
     )
 
-    action = CmdRunAction(command='git reset --hard')
+    reset_target = f' {instance["base_commit"]}' if _is_local_runtime(metadata) else ''
+    action = CmdRunAction(command=f'git reset --hard{reset_target}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(obs.exit_code == 0, f'Failed to git reset --hard: {str(obs)}')
 
-    action = CmdRunAction(
-        command='for remote_name in $(git remote); do git remote remove "${remote_name}"; done'
-    )
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(obs.exit_code == 0, f'Failed to remove git remotes: {str(obs)}')
+    if not _is_local_runtime(metadata):
+        action = CmdRunAction(
+            command='for remote_name in $(git remote); do git remote remove "${remote_name}"; done'
+        )
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert_and_raise(
+            obs.exit_code == 0, f'Failed to remove git remotes: {str(obs)}'
+        )
     ##TODO:这里看看需不需要判断其他语言的环境
     # action = CmdRunAction(command='which python')
     # action.set_hard_timeout(600)
@@ -522,6 +673,7 @@ def initialize_runtime(
 def complete_runtime(
     runtime: Runtime,
     instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+    metadata: EvalMetadata,
 ) -> dict[str, Any]:
     """Complete the runtime for the agent.
 
@@ -533,9 +685,10 @@ def complete_runtime(
     logger.info('BEGIN Runtime Completion Fn')
     logger.info('-' * 30)
     obs: CmdOutputObservation
-    workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+    workspace_path = _get_workspace_path(instance, metadata)
+    quoted_workspace_path = _shell_quote_path(workspace_path)
 
-    action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+    action = CmdRunAction(command=f'cd {quoted_workspace_path}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
@@ -550,7 +703,7 @@ def complete_runtime(
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
         # Then run the command again
-        action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+        action = CmdRunAction(command=f'cd {quoted_workspace_path}')
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
@@ -558,21 +711,21 @@ def complete_runtime(
 
     assert_and_raise(
         isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to cd to /workspace/{workspace_dir_name}: {str(obs)}',
+        f'Failed to cd to {workspace_path}: {str(obs)}',
     )
 
-    action = CmdRunAction(command='git config --global core.pager ""')
+    action = CmdRunAction(command='git config --global core.pager cat')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to git config --global core.pager "": {str(obs)}',
-    )
+    if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
+        logger.warning(
+            f'Failed to configure git pager; continuing with --no-pager: {str(obs)}'
+        )
 
 
-    action = CmdRunAction(command='git add -A')
+    action = CmdRunAction(command=_git_add_command())
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
@@ -608,7 +761,10 @@ def complete_runtime(
     git_patch = None
     while n_retries < 5:
         action = CmdRunAction(
-            command=f'git diff --no-color --cached {instance["base_commit"]} > patch.diff'
+            command=(
+                f'git --no-pager -c core.pager=cat diff --no-color '
+                f'--cached {instance["base_commit"]} > patch.diff'
+            )
         )
         action.set_hard_timeout(max(300 + 100 * n_retries, 600))
         logger.info(action, extra={'msg_type': 'ACTION'})
@@ -634,7 +790,7 @@ def complete_runtime(
     action.set_hard_timeout(max(300 + 100 * n_retries, 600))
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
-    git_patch = obs.content
+    git_patch = _clean_git_patch(obs.content)
     # pdb.set_trace() 
 
     assert_and_raise(git_patch is not None, 'Failed to get git diff (None)')
@@ -674,7 +830,7 @@ def process_instance(
     call_async_from_sync(runtime.connect)
 
     try:
-        initialize_runtime(runtime, instance)
+        initialize_runtime(runtime, instance, metadata)
 
         instruction = get_instruction(instance, metadata)
 
@@ -696,13 +852,21 @@ def process_instance(
 
         # ======= THIS IS SWE-Bench specific =======
         # Get git patch
-        return_val = complete_runtime(runtime, instance)
+        return_val = complete_runtime(runtime, instance, metadata)
         git_patch = return_val['git_patch']
         logger.info(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
         )
     finally:
-        runtime.close()
+        cleanup_runtime_image = _should_cleanup_runtime_image(metadata)
+        try:
+            runtime.close()
+        finally:
+            if cleanup_runtime_image:
+                try:
+                    _cleanup_runtime_image(runtime)
+                except Exception as exc:
+                    logger.warning(f'Runtime image cleanup failed: {exc}')
     # ==========================================
 
     # ======= Attempt to evaluate the agent's edits =======
@@ -730,7 +894,7 @@ def process_instance(
         if block and not is_binary_block:
             cleaned_lines.extend(block)
         return "\n".join(cleaned_lines)
-    git_patch = remove_binary_diffs(git_patch)
+    git_patch = _clean_git_patch(remove_binary_diffs(git_patch))
     test_result = {
         'git_patch': git_patch,
     }
@@ -800,6 +964,81 @@ def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
     return dataset
 
 
+def read_test_case_instance_ids(test_cases_file: str) -> list[str]:
+    if not os.path.isfile(test_cases_file):
+        raise FileNotFoundError(f'Test cases file does not exist: {test_cases_file}')
+
+    instance_ids = []
+    seen = set()
+    with open(test_cases_file, encoding='utf-8') as file:
+        for line_number, line in enumerate(file, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+
+            instance_id = raw
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(value, dict):
+                    instance_id = value.get('instance_id')
+                elif isinstance(value, str):
+                    instance_id = value
+                else:
+                    raise ValueError(
+                        f'{test_cases_file}:{line_number} must be an instance_id '
+                        'or a JSON object with an instance_id field'
+                    )
+
+            if not instance_id:
+                raise ValueError(
+                    f'{test_cases_file}:{line_number} is missing instance_id'
+                )
+            if instance_id not in seen:
+                seen.add(instance_id)
+                instance_ids.append(instance_id)
+
+    return instance_ids
+
+
+def filter_dataset_by_test_cases(
+    dataset: pd.DataFrame,
+    test_cases_file: str | None,
+    filter_column: str = 'instance_id',
+) -> pd.DataFrame:
+    if not test_cases_file:
+        return dataset
+
+    instance_ids = read_test_case_instance_ids(test_cases_file)
+    logger.info(
+        f'Filtering dataset by {len(instance_ids)} instance_ids from '
+        f'"{test_cases_file}"...'
+    )
+    subset = dataset[dataset[filter_column].isin(instance_ids)]
+
+    retained_ids = set(subset[filter_column].tolist())
+    missing_ids = [
+        instance_id for instance_id in instance_ids if instance_id not in retained_ids
+    ]
+    logger.info(f'Retained {subset.shape[0]} tasks after test cases filtering')
+    if missing_ids:
+        preview = ', '.join(missing_ids[:20])
+        suffix = ' ...' if len(missing_ids) > 20 else ''
+        logger.warning(
+            f'{len(missing_ids)} instance_ids from "{test_cases_file}" were not '
+            f'found in the dataset: {preview}{suffix}'
+        )
+    if subset.empty:
+        raise ValueError(
+            f'No matching instances found in dataset for test cases file: '
+            f'{test_cases_file}'
+        )
+
+    return subset
+
+
 if __name__ == '__main__':
     # pdb.set_trace()
     parser = get_parser()
@@ -828,6 +1067,46 @@ if __name__ == '__main__':
         action='store_false',
         help='rerun instances even if they are already present in output.jsonl',
     )
+    parser.add_argument(
+        '--test-cases-file',
+        type=str,
+        default=None,
+        help=(
+            'optional jsonl file limiting evaluation to matching instance_id values; '
+            'each line can be a plain instance_id or a JSON object with instance_id'
+        ),
+    )
+    parser.add_argument(
+        '--runtime',
+        type=str,
+        default=os.environ.get('RUNTIME', RUNTIME),
+        choices=['docker', 'eventstream', 'local', 'remote', 'e2b', 'modal', 'runloop'],
+        help='runtime backend to use for inference',
+    )
+    parser.add_argument(
+        '--local-repo-base-dir',
+        type=str,
+        default=os.environ.get('LOCAL_REPO_BASE_DIR'),
+        help=(
+            'base directory containing local repositories for local runtime. '
+            'Defaults to evaluation/benchmarks/swe_bench/data/<org>/<repo>. '
+            'Each instance can live in a child directory named by issue number, '
+            'instance_id, or repo/version name.'
+        ),
+    )
+    parser.add_argument(
+        '--cleanup-runtime-image',
+        default=os.environ.get('CLEANUP_RUNTIME_IMAGE', 'false').lower() == 'true',
+        dest='cleanup_runtime_image',
+        action='store_true',
+        help='remove the per-instance OpenHands runtime container and runtime image after each instance',
+    )
+    parser.add_argument(
+        '--no-cleanup-runtime-image',
+        dest='cleanup_runtime_image',
+        action='store_false',
+        help='keep runtime containers/images after each instance',
+    )
     args, _ = parser.parse_known_args()
 
     # NOTE: It is preferable to load datasets from huggingface datasets and perform post-processing
@@ -837,6 +1116,10 @@ if __name__ == '__main__':
     dataset = load_dataset("json", data_files = args.dataset)
     dataset = dataset[args.split]
     swe_bench_tests = filter_dataset(dataset.to_pandas(), 'instance_id')
+    swe_bench_tests = filter_dataset_by_test_cases(
+        swe_bench_tests,
+        args.test_cases_file,
+    )
     logger.info(
         f'Loaded dataset {args.dataset} with split {args.split}: {len(swe_bench_tests)} tasks'
     )
@@ -859,7 +1142,11 @@ if __name__ == '__main__':
             f'in {args.config_file}'
         )
 
-    details = {}
+    details = {
+        'cleanup_runtime_image': args.cleanup_runtime_image,
+        'runtime': args.runtime,
+        'local_repo_base_dir': args.local_repo_base_dir,
+    }
     _agent_cls = openhands.agenthub.Agent.get_cls(args.agent_cls)
 
     dataset_descrption = (

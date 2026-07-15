@@ -143,6 +143,7 @@ class ActionExecutor:
         username: str,
         user_id: int,
         browsergym_eval_env: str | None,
+        enable_browser: bool,
     ) -> None:
         self.plugins_to_load = plugins_to_load
         self._initial_cwd = work_dir
@@ -158,7 +159,7 @@ class ActionExecutor:
         self.lock = asyncio.Lock()
         self.plugins: dict[str, Plugin] = {}
         self.file_editor = OHEditor()
-        self.browser = BrowserEnv(browsergym_eval_env)
+        self.browser = BrowserEnv(browsergym_eval_env) if enable_browser else None
         self.start_time = time.time()
         self.last_execution_time = self.start_time
         self._initialized = False
@@ -462,7 +463,8 @@ class ActionExecutor:
         self.memory_monitor.stop_monitoring()
         if self.bash_session is not None:
             self.bash_session.close()
-        self.browser.close()
+        if self.browser is not None:
+            self.browser.close()
 
 
 if __name__ == '__main__':
@@ -479,6 +481,11 @@ if __name__ == '__main__':
         type=str,
         help='BrowserGym environment used for browser evaluation',
         default=None,
+    )
+    parser.add_argument(
+        '--disable-browser',
+        action='store_true',
+        help='Disable BrowserEnv initialization',
     )
     # example: python client.py 8000 --working-dir /workspace --plugins JupyterRequirement
     args = parser.parse_args()
@@ -501,6 +508,7 @@ if __name__ == '__main__':
             username=args.username,
             user_id=args.user_id,
             browsergym_eval_env=args.browsergym_eval_env,
+            enable_browser=not args.disable_browser,
         )
         await client.ainit()
         yield

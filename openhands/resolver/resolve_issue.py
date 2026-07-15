@@ -7,6 +7,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import shlex
 from typing import Any
 from uuid import uuid4
 
@@ -43,6 +44,34 @@ from openhands.resolver.utils import (
 )
 from openhands.runtime.base import Runtime
 
+def _clean_git_patch(git_patch: str) -> str:
+    cleaned = ''.join(
+        line
+        for line in git_patch.splitlines(keepends=True)
+        if line.rstrip('\r\n') != r'\ No newline at end of file'
+    )
+    if cleaned and not cleaned.endswith('\n'):
+        cleaned += '\n'
+    return cleaned
+
+
+def _git_add_command(prefix: str = '') -> str:
+    excluded_pathspecs = [
+        ':!.git_config',
+        ':!patch.diff',
+        ':(exclude,glob)repro*',
+        ':(exclude,glob)reproduce*',
+        ':(exclude,glob)*-repro*',
+        ':(exclude,glob)**/repro*',
+        ':(exclude,glob)**/reproduce*',
+        ':(exclude,glob)**/*-repro*',
+        ':(exclude,glob)tsconfig.*.json',
+    ]
+    return prefix + "git add -A -- . " + ' '.join(
+        shlex.quote(pathspec) for pathspec in excluded_pathspecs
+    )
+
+
 # Don't make this confgurable for now, unless we have other competitive agents
 AGENT_CLASS = 'CodeActAgent'
 
@@ -74,12 +103,14 @@ def initialize_runtime(
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
-    action = CmdRunAction(command='git config --global core.pager ""')
+    action = CmdRunAction(command='git config --global core.pager cat')
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-        raise RuntimeError(f'Failed to set git config.\n{obs}')
+        logger.warning(
+            f'Failed to configure git pager; continuing with --no-pager.\n{obs}'
+        )
 
 
 async def complete_runtime(
@@ -107,12 +138,14 @@ async def complete_runtime(
             f'Failed to change directory to /workspace. Observation: {obs}'
         )
 
-    action = CmdRunAction(command='git config --global core.pager ""')
+    action = CmdRunAction(command='git config --global core.pager cat')
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-        raise RuntimeError(f'Failed to set git config. Observation: {obs}')
+        logger.warning(
+            f'Failed to configure git pager; continuing with --no-pager. Observation: {obs}'
+        )
 
     action = CmdRunAction(command='git config --global --add safe.directory /workspace')
     logger.info(action, extra={'msg_type': 'ACTION'})
@@ -122,9 +155,9 @@ async def complete_runtime(
         raise RuntimeError(f'Failed to set git config. Observation: {obs}')
 
     if platform == Platform.GITLAB and os.getenv('GITLAB_CI') == 'true':
-        action = CmdRunAction(command='sudo git add -A')
+        action = CmdRunAction(command=_git_add_command(prefix='sudo '))
     else:
-        action = CmdRunAction(command='git add -A')
+        action = CmdRunAction(command=_git_add_command())
 
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
@@ -135,7 +168,9 @@ async def complete_runtime(
     n_retries = 0
     git_patch = None
     while n_retries < 5:
-        action = CmdRunAction(command=f'git diff --no-color --cached {base_commit}')
+        action = CmdRunAction(
+            command=f'git --no-pager -c core.pager=cat diff --no-color --cached {base_commit}'
+        )
         action.set_hard_timeout(600 + 100 * n_retries)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
@@ -143,7 +178,7 @@ async def complete_runtime(
         n_retries += 1
         if isinstance(obs, CmdOutputObservation):
             if obs.exit_code == 0:
-                git_patch = obs.content.strip()
+                git_patch = _clean_git_patch(obs.content)
                 break
             else:
                 logger.info('Failed to get git diff, retrying...')

@@ -15,6 +15,10 @@ LANGUAGE=$8
 OUTPUT_DIR=$9
 SKIP_EXISTING_OUTPUT=${10}
 CONFIG_FILE=${11:-config.toml}
+TEST_CASES_FILE=${12}
+CLEANUP_RUNTIME_IMAGE=${13:-${CLEANUP_RUNTIME_IMAGE:-false}}
+RUNTIME=${14:-${RUNTIME:-docker}}
+LOCAL_REPO_BASE_DIR=${15:-${LOCAL_REPO_BASE_DIR:-}}
 # N_RUNS is read from the environment below.
 
 if [ -z "$NUM_WORKERS" ]; then
@@ -91,6 +95,12 @@ export RUN_WITH_BROWSING=$RUN_WITH_BROWSING
 echo "RUN_WITH_BROWSING: $RUN_WITH_BROWSING"
 export LANGUAGE=$LANGUAGE
 echo "LANGUAGE: $LANGUAGE"
+export CLEANUP_RUNTIME_IMAGE=$CLEANUP_RUNTIME_IMAGE
+echo "CLEANUP_RUNTIME_IMAGE: $CLEANUP_RUNTIME_IMAGE"
+export RUNTIME=$RUNTIME
+echo "RUNTIME: $RUNTIME"
+export LOCAL_REPO_BASE_DIR=$LOCAL_REPO_BASE_DIR
+echo "LOCAL_REPO_BASE_DIR: $LOCAL_REPO_BASE_DIR"
 
 get_openhands_version
 
@@ -147,6 +157,23 @@ function run_eval() {
   elif [ "$SKIP_EXISTING_OUTPUT" = false ]; then
     echo "SKIP_EXISTING_OUTPUT: $SKIP_EXISTING_OUTPUT"
     COMMAND="$COMMAND --no-skip-existing-output"
+  fi
+
+  if [ -n "$TEST_CASES_FILE" ]; then
+    echo "TEST_CASES_FILE: $TEST_CASES_FILE"
+    COMMAND="$COMMAND --test-cases-file \"$TEST_CASES_FILE\""
+  fi
+
+  if [ "$CLEANUP_RUNTIME_IMAGE" = true ]; then
+    COMMAND="$COMMAND --cleanup-runtime-image"
+  elif [ "$CLEANUP_RUNTIME_IMAGE" = false ]; then
+    COMMAND="$COMMAND --no-cleanup-runtime-image"
+  fi
+
+  COMMAND="$COMMAND --runtime \"$RUNTIME\""
+
+  if [ -n "$LOCAL_REPO_BASE_DIR" ]; then
+    COMMAND="$COMMAND --local-repo-base-dir \"$LOCAL_REPO_BASE_DIR\""
   fi
 
   # Run the command

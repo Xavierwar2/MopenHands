@@ -32,6 +32,8 @@ def get_action_execution_server_startup_command(
         browsergym_args = [
             '--browsergym-eval-env'
         ] + sandbox_config.browsergym_eval_env.split(' ')
+    if not app_config.get_agent_config().codeact_enable_browsing:
+        browsergym_args.append('--disable-browser')
 
     username = override_username or (
         'openhands' if app_config.run_as_openhands else 'root'
