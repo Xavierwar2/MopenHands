@@ -964,6 +964,16 @@ def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
     return dataset
 
 
+def normalize_test_case_instance_id(instance_id: Any) -> str:
+    instance_id = str(instance_id).strip()
+    repo_prefix, separator, pr_number = instance_id.partition(':pr-')
+    if separator and '/' in repo_prefix and pr_number.isdigit():
+        org, repo = repo_prefix.split('/', 1)
+        if org and repo:
+            return f'{org}__{repo}-{pr_number}'
+    return instance_id
+
+
 def read_test_case_instance_ids(test_cases_file: str) -> list[str]:
     if not os.path.isfile(test_cases_file):
         raise FileNotFoundError(f'Test cases file does not exist: {test_cases_file}')
@@ -984,6 +994,8 @@ def read_test_case_instance_ids(test_cases_file: str) -> list[str]:
             else:
                 if isinstance(value, dict):
                     instance_id = value.get('instance_id')
+                    if not instance_id and value.get('repo') and value.get('number'):
+                        instance_id = f'{value["repo"]}:pr-{value["number"]}'
                 elif isinstance(value, str):
                     instance_id = value
                 else:
@@ -996,6 +1008,7 @@ def read_test_case_instance_ids(test_cases_file: str) -> list[str]:
                 raise ValueError(
                     f'{test_cases_file}:{line_number} is missing instance_id'
                 )
+            instance_id = normalize_test_case_instance_id(instance_id)
             if instance_id not in seen:
                 seen.add(instance_id)
                 instance_ids.append(instance_id)
@@ -1073,7 +1086,8 @@ if __name__ == '__main__':
         default=None,
         help=(
             'optional jsonl file limiting evaluation to matching instance_id values; '
-            'each line can be a plain instance_id or a JSON object with instance_id'
+            'each line can be a plain instance_id, a repo:pr-number value, '
+            'or a JSON object with instance_id'
         ),
     )
     parser.add_argument(
